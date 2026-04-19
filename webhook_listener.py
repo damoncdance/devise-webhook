@@ -144,6 +144,15 @@ def create_interaction(fields: dict) -> dict:
     return _airtable_create(INTERACTIONS_TABLE, fields)
 
 
+def _airtable_update(table: str, record_id: str, fields: dict) -> dict:
+    """Update a single record in an Airtable table (PATCH — merge, not replace)."""
+    url = f"{AIRTABLE_BASE_URL}/{AIRTABLE_BASE_ID}/{table}/{record_id}"
+    payload = {"fields": fields}
+    resp = requests.patch(url, headers=_airtable_headers(), json=payload, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
 # ---------------------------------------------------------------------------
 # Signature verification
 # ---------------------------------------------------------------------------
@@ -251,6 +260,7 @@ def _parse_openphone_event(event_type: str, payload: dict) -> dict | None:
 # ---------------------------------------------------------------------------
 
 _INSTANTLY_OUTCOME_MAP = {
+    "email_sent": "Sent",
     "email_opened": "Opened",
     "email_replied": "Replied",
     "email_bounced": "Bounced",
@@ -258,6 +268,7 @@ _INSTANTLY_OUTCOME_MAP = {
 }
 
 _INSTANTLY_DIRECTION_MAP = {
+    "email_sent": "Outbound",
     "email_opened": "Outbound",
     "email_replied": "Inbound",
     "email_bounced": "Outbound",
@@ -363,13 +374,77 @@ def _log_interaction(
     try:
         record = create_interaction(fields)
         logger.info(f"Interaction created: {record['id']} for {contact_name} ({pin})")
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={"status": "ok", "interaction_id": record["id"], "pin": pin},
-        )
     except Exception as exc:
         logger.error(f"Failed to create Interaction: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
+
+    # 4. Update Contact measurement fields based on event outcome
+    try:
+        _update_contact_measurement_fields(
+            contact_id, contact, event_fields.get("outcome", ""), event_fields.get("timestamp", "")
+        )
+    except Exception as exc:
+        # Non-fatal — log but don't fail the webhook
+        logger.warning(f"Failed to update Contact measurement fields: {exc}")
+
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={"status": "ok", "interaction_id": record["id"], "pin": pin},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Contact measurement field updates
+# ---------------------------------------------------------------------------
+
+def _update_contact_measurement_fields(
+    contact_id: str,
+    contact_record: dict,
+    outcome: str,
+    timestamp: str,
+) -> None:
+    """
+    Update Contact-level measurement fields after logging an Interaction.
+    Only sets fields that are relevant to the event outcome.
+    Uses first-write semantics for timestamp fields (won't overwrite existing values).
+    """
+    existing = contact_record.get("fields", {})
+    updates: dict[str, Any] = {}
+
+    if outcome == "Sent":
+        # First touch tracking
+        if not existing.get("First Touched At"):
+            updates["First Touched At"] = timestamp
+        # Set deliverability to Delivered (may be overridden by Bounced later)
+        if not existing.get("Deliverability Status"):
+            updates["Deliverability Status"] = "Delivered"
+
+    elif outcome == "Opened":
+        # Increment open count
+        current_count = existing.get("Open Count") or 0
+        updates["Open Count"] = current_count + 1
+        if not existing.get("First Opened At"):
+            updates["First Opened At"] = timestamp
+
+    elif outcome == "Replied":
+        if not existing.get("First Replied At"):
+            updates["First Replied At"] = timestamp
+        # Set sentiment to Unclassified pending manual review
+        if not existing.get("Reply Sentiment"):
+            updates["Reply Sentiment"] = "Unclassified"
+
+    elif outcome == "Bounced":
+        updates["Bounce Flag"] = True
+        updates["Deliverability Status"] = "Bounced"
+
+    elif outcome == "Unsubscribed":
+        updates["Unsubscribed"] = True
+        updates["Unsubscribed At"] = timestamp
+        updates["Deliverability Status"] = "Unsubscribed"
+
+    if updates:
+        _airtable_update(CONTACTS_TABLE, contact_id, updates)
+        logger.info(f"Contact {contact_id} measurement fields updated: {list(updates.keys())}")
 
 
 # ---------------------------------------------------------------------------
