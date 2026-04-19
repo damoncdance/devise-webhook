@@ -94,7 +94,7 @@ def _airtable_search(table: str, formula: str) -> list[dict]:
 def _airtable_create(table: str, fields: dict) -> dict:
     """Create a single record in an Airtable table."""
     url = f"{AIRTABLE_BASE_URL}/{AIRTABLE_BASE_ID}/{table}"
-    payload = {"fields": fields}
+    payload = {"fields": fields, "typecast": True}
     resp = requests.post(url, headers=_airtable_headers(), json=payload, timeout=10)
     resp.raise_for_status()
     return resp.json()
@@ -128,7 +128,7 @@ def find_contact_by_email(email: str) -> dict | None:
 
 def get_linked_property(contact_record: dict) -> dict | None:
     """Get the first linked Property record from a Contact."""
-    linked = contact_record.get("fields", {}).get("Link to Properties", [])
+    linked = contact_record.get("fields", {}).get("Properties", [])
     if not linked:
         return None
     prop_id = linked[0] if isinstance(linked[0], str) else linked[0].get("id")
