@@ -11,7 +11,8 @@ Deployable to Railway.app — see Procfile and requirements.txt in project root.
 Endpoints:
   POST /webhook/openphone  — call.completed, message.received,
                              call.transcript.completed, call.summary.completed
-  POST /webhook/instantly  — email_sent, email_opened, email_replied, email_bounced, unsubscribed
+  POST /webhook/instantly  — email_sent, email_opened, email_replied, email_bounced,
+                             unsubscribed, lead_interested, email_account_error
   GET  /health             — Railway health check
 
 Environment variables (never hardcode):
@@ -270,6 +271,7 @@ _INSTANTLY_OUTCOME_MAP = {
     "email_replied": "Replied",
     "email_bounced": "Bounced",
     "unsubscribed": "Unsubscribed",
+    "lead_interested": "Interested",
 }
 
 _INSTANTLY_DIRECTION_MAP = {
@@ -278,6 +280,7 @@ _INSTANTLY_DIRECTION_MAP = {
     "email_replied": "Inbound",
     "email_bounced": "Outbound",
     "unsubscribed": "Inbound",
+    "lead_interested": "Inbound",
 }
 
 
@@ -448,6 +451,10 @@ def _update_contact_measurement_fields(
         updates["Unsubscribed"] = True
         updates["Unsubscribed At"] = timestamp
         updates["Deliverability Status"] = "Unsubscribed"
+
+    elif outcome == "Interested":
+        if not existing.get("Reply Sentiment"):
+            updates["Reply Sentiment"] = "Interested"
 
     if updates:
         _airtable_update(CONTACTS_TABLE, contact_id, updates)
@@ -648,6 +655,29 @@ async def webhook_instantly(request: Request):
 
     event_type = payload.get("event_type", "")
     logger.info(f"Instantly event: {event_type}")
+
+    # Account-level error — no lead_email, log as system Interaction
+    if event_type == "email_account_error":
+        data = payload.get("data", {})
+        account = data.get("account_email") or data.get("email") or "unknown"
+        error_type = data.get("error_type") or "unknown"
+        error_msg = data.get("error_message") or ""
+        ts = payload.get("timestamp") or datetime.now(timezone.utc).isoformat()
+        logger.warning(f"Instantly account error: {account} — {error_type}: {error_msg}")
+        try:
+            record = create_interaction({
+                "Interaction ID": f"acct-error-{ts[:10]}-{account[:20]}",
+                "Type": "System",
+                "Direction": "Inbound",
+                "Outcome": "Account Error",
+                "Date and Time": ts,
+                "Source": "Instantly",
+                "Notes": f"Account: {account}\nError: {error_type}\n{error_msg}",
+            })
+            return JSONResponse(status_code=200, content={"status": "ok", "interaction_id": record["id"], "event": "email_account_error"})
+        except Exception as exc:
+            logger.error(f"Failed to log account error interaction: {exc}")
+            raise HTTPException(status_code=500, detail=str(exc))
 
     event_fields = _parse_instantly_event(event_type, payload)
     if not event_fields:
