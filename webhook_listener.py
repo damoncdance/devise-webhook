@@ -9,8 +9,9 @@ Purpose:
 Deployable to Railway.app — see Procfile and requirements.txt in project root.
 
 Endpoints:
-  POST /webhook/openphone  — call.completed, message.received
-  POST /webhook/instantly  — email_opened, email_replied, email_bounced, unsubscribed
+  POST /webhook/openphone  — call.completed, message.received,
+                             call.transcript.completed, call.summary.completed
+  POST /webhook/instantly  — email_sent, email_opened, email_replied, email_bounced, unsubscribed
   GET  /health             — Railway health check
 
 Environment variables (never hardcode):
@@ -229,6 +230,9 @@ def _parse_openphone_event(event_type: str, payload: dict) -> dict | None:
     status_raw = str(data.get("status", "")).lower()
     ts = data.get("createdAt") or data.get("completedAt") or datetime.now(timezone.utc).isoformat()
 
+    # Extract callId from payload root (call-related events)
+    call_id = payload.get("data", {}).get("object", {}).get("callId") or ""
+
     if event_type == "call.completed":
         phone = data.get("from") if direction_raw == "inbound" else data.get("to")
         return {
@@ -240,6 +244,7 @@ def _parse_openphone_event(event_type: str, payload: dict) -> dict | None:
             "recording_url": (data.get("recording") or {}).get("url"),
             "ai_summary": data.get("summary"),
             "timestamp": ts,
+            "openphone_call_id": call_id,
         }
 
     if event_type == "message.received":
@@ -370,6 +375,8 @@ def _log_interaction(
         fields["Subject"] = event_fields["subject"]
     if event_fields.get("sequence_tier"):
         fields["Sequence Tier"] = event_fields["sequence_tier"]
+    if event_fields.get("openphone_call_id"):
+        fields["OpenPhone Call ID"] = event_fields["openphone_call_id"]
 
     try:
         record = create_interaction(fields)
@@ -448,6 +455,140 @@ def _update_contact_measurement_fields(
 
 
 # ---------------------------------------------------------------------------
+# OpenPhone transcript/summary handlers
+# ---------------------------------------------------------------------------
+
+def _find_interaction_by_call_id(call_id: str) -> dict | None:
+    """Look up an Interaction record by OpenPhone Call ID."""
+    if not call_id:
+        return None
+    formula = f'{{OpenPhone Call ID}}="{call_id}"'
+    records = _airtable_search(INTERACTIONS_TABLE, formula)
+    return records[0] if records else None
+
+
+def _format_transcript(dialogue: list[dict]) -> str:
+    """Convert OpenPhone dialogue array to readable transcript text."""
+    lines = []
+    for entry in dialogue:
+        speaker = entry.get("identifier") or entry.get("userId") or "Unknown"
+        content = entry.get("content", "")
+        start = entry.get("start")
+        ts_prefix = f"[{start:.1f}s] " if start is not None else ""
+        lines.append(f"{ts_prefix}{speaker}: {content}")
+    return "\n".join(lines)
+
+
+def _handle_transcript_completed(payload: dict) -> JSONResponse:
+    """
+    Handle call.transcript.completed / callTranscript events.
+    Looks up existing Interaction by callId and appends transcript data.
+    """
+    data = payload.get("data", {}).get("object", {})
+    call_id = data.get("callId", "")
+    if not call_id:
+        logger.warning("Transcript event missing callId")
+        return JSONResponse(status_code=200, content={"status": "ignored", "reason": "no callId"})
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    dialogue = data.get("dialogue", [])
+    transcript_text = _format_transcript(dialogue) if dialogue else ""
+
+    # Look up existing Interaction
+    interaction = _find_interaction_by_call_id(call_id)
+
+    updates: dict[str, Any] = {
+        "Transcript Received At": now_iso,
+    }
+    if transcript_text:
+        updates["Call Transcript"] = transcript_text
+    if data.get("duration"):
+        updates["Duration seconds"] = data["duration"]
+
+    if interaction:
+        record_id = interaction["id"]
+        try:
+            _airtable_update(INTERACTIONS_TABLE, record_id, updates)
+            logger.info(f"Transcript appended to interaction {record_id} (callId={call_id})")
+            return JSONResponse(status_code=200, content={"status": "ok", "interaction_id": record_id, "action": "updated"})
+        except Exception as exc:
+            logger.error(f"Failed to update Interaction with transcript: {exc}")
+            raise HTTPException(status_code=500, detail=str(exc))
+    else:
+        logger.warning(f"No existing Interaction for callId={call_id} — creating stub record")
+        updates["Interaction ID"] = f"transcript-{call_id[:20]}"
+        updates["Type"] = "Call"
+        updates["Source"] = "OpenPhone"
+        updates["OpenPhone Call ID"] = call_id
+        updates["Notes"] = "Auto-created from transcript event (call.completed not yet received)"
+        updates["Date and Time"] = data.get("createdAt") or now_iso
+        try:
+            record = _airtable_create(INTERACTIONS_TABLE, updates)
+            logger.info(f"Stub Interaction created for transcript: {record['id']} (callId={call_id})")
+            return JSONResponse(status_code=200, content={"status": "ok", "interaction_id": record["id"], "action": "created_stub"})
+        except Exception as exc:
+            logger.error(f"Failed to create stub Interaction for transcript: {exc}")
+            raise HTTPException(status_code=500, detail=str(exc))
+
+
+def _handle_summary_completed(payload: dict) -> JSONResponse:
+    """
+    Handle call.summary.completed / callSummary events.
+    Looks up existing Interaction by callId and appends summary data.
+    """
+    data = payload.get("data", {}).get("object", {})
+    call_id = data.get("callId", "")
+    if not call_id:
+        logger.warning("Summary event missing callId")
+        return JSONResponse(status_code=200, content={"status": "ignored", "reason": "no callId"})
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    summary_lines = data.get("summary") or []
+    next_steps = data.get("nextSteps") or []
+    summary_text = "\n".join(summary_lines) if isinstance(summary_lines, list) else str(summary_lines)
+    next_steps_text = "\n".join(next_steps) if isinstance(next_steps, list) else str(next_steps)
+
+    # Look up existing Interaction
+    interaction = _find_interaction_by_call_id(call_id)
+
+    updates: dict[str, Any] = {
+        "Summary Received At": now_iso,
+    }
+    if summary_text:
+        updates["Call Summary"] = summary_text
+    if next_steps_text:
+        updates["Call Next Steps"] = next_steps_text
+    # Also write to AI Summary for backward compatibility with existing views
+    if summary_text:
+        updates["AI Summary"] = summary_text
+
+    if interaction:
+        record_id = interaction["id"]
+        try:
+            _airtable_update(INTERACTIONS_TABLE, record_id, updates)
+            logger.info(f"Summary appended to interaction {record_id} (callId={call_id})")
+            return JSONResponse(status_code=200, content={"status": "ok", "interaction_id": record_id, "action": "updated"})
+        except Exception as exc:
+            logger.error(f"Failed to update Interaction with summary: {exc}")
+            raise HTTPException(status_code=500, detail=str(exc))
+    else:
+        logger.warning(f"No existing Interaction for callId={call_id} — creating stub record")
+        updates["Interaction ID"] = f"summary-{call_id[:20]}"
+        updates["Type"] = "Call"
+        updates["Source"] = "OpenPhone"
+        updates["OpenPhone Call ID"] = call_id
+        updates["Notes"] = "Auto-created from summary event (call.completed not yet received)"
+        updates["Date and Time"] = now_iso
+        try:
+            record = _airtable_create(INTERACTIONS_TABLE, updates)
+            logger.info(f"Stub Interaction created for summary: {record['id']} (callId={call_id})")
+            return JSONResponse(status_code=200, content={"status": "ok", "interaction_id": record["id"], "action": "created_stub"})
+        except Exception as exc:
+            logger.error(f"Failed to create stub Interaction for summary: {exc}")
+            raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -473,6 +614,13 @@ async def webhook_openphone(request: Request):
 
     event_type = payload.get("type", "")
     logger.info(f"OpenPhone event: {event_type}")
+
+    # Route transcript/summary events to dedicated handlers
+    # OpenPhone uses "callTranscript" or "call.transcript.completed" as the type
+    if event_type in ("call.transcript.completed", "callTranscript"):
+        return _handle_transcript_completed(payload)
+    if event_type in ("call.summary.completed", "callSummary"):
+        return _handle_summary_completed(payload)
 
     event_fields = _parse_openphone_event(event_type, payload)
     if not event_fields:
